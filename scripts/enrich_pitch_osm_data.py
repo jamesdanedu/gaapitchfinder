@@ -416,6 +416,59 @@ out skel qt;
 
         return None
 
+    def query_pitch(self, lat, lon, radius=SEARCH_RADIUS_M):
+        """
+        Query pitches within *radius* metres of a single centroid.
+        Used as a fallback when the county bbox is too large for a
+        single batch query. Same retry / rotation logic as query_county.
+        """
+        query = f"""
+[out:json][timeout:25];
+(
+  way["sport"="gaelic_football"](around:{radius},{lat},{lon});
+  way["sport"="hurling"](around:{radius},{lat},{lon});
+  way["sport"="gaelic_games"](around:{radius},{lat},{lon});
+  way["leisure"="pitch"](around:{radius},{lat},{lon});
+  relation["sport"="gaelic_football"](around:{radius},{lat},{lon});
+  relation["sport"="hurling"](around:{radius},{lat},{lon});
+  relation["sport"="gaelic_games"](around:{radius},{lat},{lon});
+  relation["leisure"="pitch"](around:{radius},{lat},{lon});
+);
+out body;
+>;
+out skel qt;
+"""
+        for attempt in range(MAX_RETRIES_PER_COUNTY):
+            endpoint = self.current_endpoint
+            try:
+                resp = requests.post(
+                    endpoint, data={"data": query}, timeout=REQUEST_TIMEOUT_S,
+                )
+                if resp.status_code == 429:
+                    time.sleep(RATE_LIMIT_WAIT_S)
+                    self.rotate_endpoint()
+                    self._consecutive_errors += 1
+                    continue
+                if resp.status_code in (502, 503, 504):
+                    time.sleep(RATE_LIMIT_WAIT_S)
+                    self.rotate_endpoint()
+                    self._consecutive_errors += 1
+                    continue
+                resp.raise_for_status()
+                self._consecutive_errors = 0
+                return resp.json().get("elements", [])
+            except requests.exceptions.Timeout:
+                time.sleep(RATE_LIMIT_WAIT_S)
+                self.rotate_endpoint()
+                self._consecutive_errors += 1
+            except requests.exceptions.ConnectionError:
+                time.sleep(CONNECTION_ERROR_WAIT_S)
+                self._consecutive_errors += 1
+            except requests.exceptions.RequestException:
+                time.sleep(CONNECTION_ERROR_WAIT_S)
+                self._consecutive_errors += 1
+        return None
+
 # ---------------------------------------------------------------------------
 # Local matching: match centroids to OSM polygons within a county batch
 # ---------------------------------------------------------------------------
@@ -454,7 +507,7 @@ def find_best_match(centroid_lat, centroid_lon, ways, node_lookup):
     gaa_tags = {"gaelic_football", "hurling", "gaelic_games"}
     candidates = []
 
-    for way in ways:
+    for idx, way in enumerate(ways):
         wc = compute_way_centroid(way, node_lookup)
         if wc is None:
             continue
@@ -464,14 +517,15 @@ def find_best_match(centroid_lat, centroid_lon, ways, node_lookup):
         tags = way.get("tags", {})
         sport = tags.get("sport", "")
         is_gaa = sport in gaa_tags
-        # Score: GAA-specific first (0), then generic (1), then by distance
-        candidates.append((0 if is_gaa else 1, dist, way))
+        # Score: GAA-specific first (0), then generic (1), then distance,
+        # then index as tiebreaker to avoid comparing dicts
+        candidates.append((0 if is_gaa else 1, dist, idx, way))
 
     if not candidates:
         return None, None
 
-    candidates.sort()
-    return candidates[0][2], node_lookup
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates[0][3], node_lookup
 
 # ---------------------------------------------------------------------------
 # Checkpoint logic
@@ -497,11 +551,16 @@ def save_checkpoint(processed_indices, completed_counties):
         }, f)
 
 
+# Maximum bbox span in degrees before we switch to per-pitch queries.
+# ~2 degrees lat/lon ≈ 220km x 140km at Irish latitudes — generous for a county.
+MAX_BBOX_SPAN_DEG = 2.0
+
+
 def get_county_bbox(county_name, df_county):
     """
     Get bounding box for a county. Uses hardcoded Irish county boxes
     when available, otherwise computes from the centroid data with padding.
-    Returns (min_lat, min_lon, max_lat, max_lon).
+    Returns (min_lat, min_lon, max_lat, max_lon) or None.
     """
     if county_name in IRELAND_COUNTY_BBOXES:
         return IRELAND_COUNTY_BBOXES[county_name]
@@ -514,6 +573,12 @@ def get_county_bbox(county_name, df_county):
     max_lat = valid["Latitude"].max() + 0.05
     min_lon = valid["Longitude"].min() - 0.05
     max_lon = valid["Longitude"].max() + 0.05
+
+    # If the bbox is too large (pitches spread across a whole country),
+    # return None to signal that per-pitch queries should be used instead.
+    if (max_lat - min_lat) > MAX_BBOX_SPAN_DEG or (max_lon - min_lon) > MAX_BBOX_SPAN_DEG:
+        return None
+
     return (min_lat, min_lon, max_lat, max_lon)
 
 # ---------------------------------------------------------------------------
@@ -577,6 +642,84 @@ def process_county(county_name, df_county, df_out, processed, node_lookup, ways,
                 processed.add(idx)
                 stats["matched"] += 1
                 print(f"    {club}: OK ({source}, {length}x{width}m, {orient}deg)")
+
+
+def _apply_match_to_row(idx, way, nl, df_out, processed, stats, club):
+    """Write a matched (or unmatched) way result into df_out for one pitch."""
+    if way is None:
+        df_out.at[idx, "geometry_source"] = "not_found"
+        df_out.at[idx, "geometry_verified"] = False
+        processed.add(idx)
+        stats["not_found"] += 1
+        print(f"    {club}: not found")
+        return
+    corners, source = extract_geometry(way, nl)
+    if corners is None:
+        df_out.at[idx, "geometry_source"] = "not_found"
+        df_out.at[idx, "geometry_verified"] = False
+        processed.add(idx)
+        stats["not_found"] += 1
+        print(f"    {club}: not found (bad geometry)")
+        return
+    length, width, orient = compute_pitch_metrics(corners)
+    df_out.at[idx, "osm_way_id"] = way["id"]
+    df_out.at[idx, "corner_nw_lat"] = round(corners["nw"][0], 7)
+    df_out.at[idx, "corner_nw_lon"] = round(corners["nw"][1], 7)
+    df_out.at[idx, "corner_ne_lat"] = round(corners["ne"][0], 7)
+    df_out.at[idx, "corner_ne_lon"] = round(corners["ne"][1], 7)
+    df_out.at[idx, "corner_se_lat"] = round(corners["se"][0], 7)
+    df_out.at[idx, "corner_se_lon"] = round(corners["se"][1], 7)
+    df_out.at[idx, "corner_sw_lat"] = round(corners["sw"][0], 7)
+    df_out.at[idx, "corner_sw_lon"] = round(corners["sw"][1], 7)
+    df_out.at[idx, "pitch_length_m"] = length
+    df_out.at[idx, "pitch_width_m"] = width
+    df_out.at[idx, "orientation_degrees"] = orient
+    df_out.at[idx, "geometry_source"] = source
+    df_out.at[idx, "geometry_verified"] = False
+    processed.add(idx)
+    stats["matched"] += 1
+    print(f"    {club}: OK ({source}, {length}x{width}m, {orient}deg)")
+
+
+def process_county_per_pitch(county_name, df_county, df_out, processed,
+                              client, stats):
+    """
+    Fallback for counties whose bbox is too large (e.g. China, Canada).
+    Issues one Overpass query per pitch centroid with a polite delay.
+    """
+    for _, row in df_county.iterrows():
+        idx = row.name
+        if idx in processed:
+            continue
+
+        club = row.get("Club", "")
+        lat = row.get("Latitude")
+        lon = row.get("Longitude")
+
+        if pd.isna(lat) or pd.isna(lon):
+            df_out.at[idx, "geometry_source"] = "not_found"
+            df_out.at[idx, "geometry_verified"] = False
+            processed.add(idx)
+            stats["not_found"] += 1
+            print(f"    {club}: SKIP (no coordinates)")
+            continue
+
+        lat, lon = float(lat), float(lon)
+        print(f"    {club}: querying …", end=" ", flush=True)
+
+        elements = client.query_pitch(lat, lon)
+        if elements is None:
+            df_out.at[idx, "geometry_source"] = "api_error"
+            df_out.at[idx, "geometry_verified"] = False
+            processed.add(idx)
+            stats["api_errors"] += 1
+            print("api_error")
+        else:
+            node_lookup, ways = parse_osm_elements(elements)
+            way, nl = find_best_match(lat, lon, ways, node_lookup)
+            _apply_match_to_row(idx, way, nl, df_out, processed, stats, club)
+
+        client.polite_delay()
 
 
 def main():
@@ -681,7 +824,9 @@ def main():
 
         # Get bounding box
         bbox = get_county_bbox(county_name, df_county)
-        if bbox is None:
+        has_coords = df_county.dropna(subset=["Latitude", "Longitude"]).shape[0] > 0
+
+        if bbox is None and not has_coords:
             print(f"  SKIP: no valid coordinates for {county_name}")
             for idx in df_county.index:
                 if idx not in processed:
@@ -694,32 +839,39 @@ def main():
             df_out.to_csv(output_csv, index=False)
             continue
 
-        print(f"  BBox: ({bbox[0]:.4f}, {bbox[1]:.4f}, {bbox[2]:.4f}, {bbox[3]:.4f})")
+        if bbox is None and has_coords:
+            # BBox too large (pitches spread across a huge area, e.g. China).
+            # Fall back to individual per-pitch queries.
+            print(f"  BBox too large — falling back to per-pitch queries.")
+            process_county_per_pitch(county_name, df_county, df_out,
+                                     processed, client, stats)
+        else:
+            print(f"  BBox: ({bbox[0]:.4f}, {bbox[1]:.4f}, {bbox[2]:.4f}, {bbox[3]:.4f})")
 
-        # Batch query for entire county
-        elements = client.query_county(bbox)
+            # Batch query for entire county
+            elements = client.query_county(bbox)
 
-        if elements is None:
-            print(f"  API FAILED for {county_name} after {MAX_RETRIES_PER_COUNTY} retries.")
-            print(f"  Marking {unprocessed_count} pitches as api_error.")
-            for idx in df_county.index:
-                if idx not in processed:
-                    df_out.at[idx, "geometry_source"] = "api_error"
-                    df_out.at[idx, "geometry_verified"] = False
-                    processed.add(idx)
-                    stats["api_errors"] += 1
-            # Do NOT add to completed_counties so it can be retried
-            save_checkpoint(processed, completed_counties)
-            df_out.to_csv(output_csv, index=False)
-            continue
+            if elements is None:
+                print(f"  API FAILED for {county_name} after {MAX_RETRIES_PER_COUNTY} retries.")
+                print(f"  Marking {unprocessed_count} pitches as api_error.")
+                for idx in df_county.index:
+                    if idx not in processed:
+                        df_out.at[idx, "geometry_source"] = "api_error"
+                        df_out.at[idx, "geometry_verified"] = False
+                        processed.add(idx)
+                        stats["api_errors"] += 1
+                # Do NOT add to completed_counties so it can be retried
+                save_checkpoint(processed, completed_counties)
+                df_out.to_csv(output_csv, index=False)
+                continue
 
-        # Parse elements
-        node_lookup, ways = parse_osm_elements(elements)
-        print(f"  Found {len(ways)} OSM ways, {len(node_lookup)} nodes.")
+            # Parse elements
+            node_lookup, ways = parse_osm_elements(elements)
+            print(f"  Found {len(ways)} OSM ways, {len(node_lookup)} nodes.")
 
-        # Match each pitch locally
-        process_county(county_name, df_county, df_out, processed,
-                       node_lookup, ways, stats)
+            # Match each pitch locally
+            process_county(county_name, df_county, df_out, processed,
+                           node_lookup, ways, stats)
 
         # Mark county as complete and save
         completed_counties.add(county_name)
